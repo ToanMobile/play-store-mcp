@@ -81,6 +81,12 @@ MAX_RETRIES = 3
 INITIAL_BACKOFF = 1.0  # seconds
 MAX_BACKOFF = 32.0  # seconds
 
+# HTTP methods whose requests are safe to retry on an ambiguous server error
+# (500/503): repeating them cannot create a duplicate side effect. Non-idempotent
+# requests (POST: create, upload, acknowledge, consume, refund, revoke, defer,
+# commit, ...) are only retried on 429 (throttled, so never applied).
+_IDEMPOTENT_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+
 # Revocation contexts for subscription refunds (Purchases.subscriptionsv2.revoke)
 _REVOCATION_CONTEXTS: dict[str, dict[str, dict]] = {
     "full": {"fullRefund": {}},
@@ -103,6 +109,20 @@ def _parse_timestamp(value: dict[str, Any] | None) -> datetime | None:
         nanos = int(value.get("nanos", 0) or 0)
         return datetime.fromtimestamp(int(seconds) + nanos / 1_000_000_000, tz=UTC)
     except (TypeError, ValueError, OSError):
+        return None
+
+
+def _parse_rfc3339(value: str | None) -> datetime | None:
+    """Parse an RFC3339 timestamp string (e.g. "2024-10-02T15:01:23Z") to datetime.
+
+    The subscriptions v2 API returns RFC3339 strings rather than the protobuf
+    {seconds, nanos} form handled by ``_parse_timestamp``.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
         return None
 
 
@@ -137,41 +157,64 @@ def _parse_review(review_data: dict[str, Any]) -> Review | None:
     )
 
 
-def retry_with_backoff(func):  # type: ignore[no-untyped-def]
-    """Decorator to retry API calls with exponential backoff.
+def _is_retryable_status(status: int, *, retry_server_errors: bool) -> bool:
+    """Whether an HTTP error status should be retried.
 
-    Retries on transient errors (500, 503) and rate limit errors (429).
+    429 (rate limited) is always retryable: the request was throttled, not
+    applied, so repeating it is safe for any HTTP method. 500/503 are retried
+    only when ``retry_server_errors`` is set (idempotent requests), because the
+    server may have already applied a non-idempotent request before erroring.
+    """
+    if status == 429:
+        return True
+    return retry_server_errors and status in (500, 503)
+
+
+def _run_with_backoff(call, *, retry_server_errors=True):  # type: ignore[no-untyped-def]
+    """Run ``call`` with exponential-backoff retries on transient errors."""
+    retries = 0
+    backoff = INITIAL_BACKOFF
+
+    while retries < MAX_RETRIES:
+        try:
+            return call()
+        except HttpError as e:
+            if not _is_retryable_status(e.resp.status, retry_server_errors=retry_server_errors):
+                raise
+            retries += 1
+            if retries >= MAX_RETRIES:
+                raise
+
+            # Add jitter to prevent thundering herd
+            sleep_time = backoff * (0.5 + random.random())  # noqa: S311 # nosec B311 — non-crypto jitter for retry backoff
+            logger.warning(
+                "API error, retrying",
+                status=e.resp.status,
+                retry=retries,
+                sleep=sleep_time,
+            )
+            time.sleep(sleep_time)
+            backoff = min(backoff * 2, MAX_BACKOFF)
+
+    # The loop above always returns or raises while MAX_RETRIES >= 1. This
+    # guards against a misconfigured MAX_RETRIES so a call can never fall
+    # through and implicitly return None.
+    raise PlayStoreClientError(  # pragma: no cover - only reachable if MAX_RETRIES <= 0
+        "Retry attempts exhausted without a result"
+    )
+
+
+def retry_with_backoff(func):  # type: ignore[no-untyped-def]
+    """Decorator to retry a call on transient errors (429/500/503).
+
+    For idempotent operations only (e.g. building the API service). Individual
+    Play API requests go through ``PlayStoreClient._execute``, which decides
+    whether to retry server errors based on the request's HTTP method.
     """
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
-        retries = 0
-        backoff = INITIAL_BACKOFF
-
-        while retries < MAX_RETRIES:
-            try:
-                return func(*args, **kwargs)
-            except HttpError as e:
-                # Retry on server errors and rate limits
-                if e.resp.status in (429, 500, 503):
-                    retries += 1
-                    if retries >= MAX_RETRIES:
-                        raise
-
-                    # Add jitter to prevent thundering herd
-                    sleep_time = backoff * (0.5 + random.random())  # noqa: S311 # nosec B311 — non-crypto jitter for retry backoff
-                    logger.warning(
-                        "API error, retrying",
-                        status=e.resp.status,
-                        retry=retries,
-                        sleep=sleep_time,
-                    )
-                    time.sleep(sleep_time)
-                    backoff = min(backoff * 2, MAX_BACKOFF)
-                else:
-                    raise
-            except Exception:
-                raise
+        return _run_with_backoff(lambda: func(*args, **kwargs), retry_server_errors=True)
 
     return wrapper
 
@@ -383,6 +426,21 @@ class PlayStoreClient:
             self._logger.exception("Failed to initialize API client", error=str(e))
             raise PlayStoreClientError(f"Failed to initialize API client: {e}") from e
 
+    def _execute(self, request: Any) -> Any:
+        """Execute a googleapiclient request with retry/backoff.
+
+        All Play API calls go through here. 429 (rate limited) is always
+        retried; 500/503 are retried only for idempotent HTTP methods. A
+        non-idempotent request (POST: create, upload, acknowledge, consume,
+        refund, revoke, defer, commit, ...) is not retried on a 5xx, because
+        the server may have already applied it and a retry could duplicate the
+        side effect. Non-transient errors (e.g. 400/403/404) propagate to each
+        caller's own ``except HttpError`` handling.
+        """
+        method = (getattr(request, "method", "") or "").upper()
+        retry_server_errors = method in _IDEMPOTENT_HTTP_METHODS
+        return _run_with_backoff(request.execute, retry_server_errors=retry_server_errors)
+
     def _create_edit(self, package_name: str) -> str:
         """Create a new edit for the package.
 
@@ -393,7 +451,11 @@ class PlayStoreClient:
             Edit ID.
         """
         service = self._get_service()
-        result = service.edits().insert(packageName=package_name, body={}).execute()
+        try:
+            result = self._execute(service.edits().insert(packageName=package_name, body={}))
+        except HttpError as e:
+            self._logger.exception("Failed to create edit", error=str(e))
+            raise PlayStoreClientError(f"Failed to create edit: {e.reason}") from e
         edit_id: str = result["id"]
         self._logger.debug("Created edit", package_name=package_name, edit_id=edit_id)
         return edit_id
@@ -406,7 +468,7 @@ class PlayStoreClient:
             edit_id: Edit ID to commit.
         """
         service = self._get_service()
-        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+        self._execute(service.edits().commit(packageName=package_name, editId=edit_id))
         self._logger.debug("Committed edit", package_name=package_name, edit_id=edit_id)
 
     def _delete_edit(self, package_name: str, edit_id: str) -> None:
@@ -418,7 +480,7 @@ class PlayStoreClient:
         """
         service = self._get_service()
         try:
-            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+            self._execute(service.edits().delete(packageName=package_name, editId=edit_id))
             self._logger.debug("Deleted edit", package_name=package_name, edit_id=edit_id)
         except HttpError as e:
             # Edit may have already been committed or expired
@@ -442,8 +504,8 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            result = (
-                service.edits().tracks().list(packageName=package_name, editId=edit_id).execute()
+            result = self._execute(
+                service.edits().tracks().list(packageName=package_name, editId=edit_id)
             )
 
             tracks: list[TrackInfo] = []
@@ -475,6 +537,9 @@ class PlayStoreClient:
                 )
 
             return tracks
+        except HttpError as e:
+            self._logger.exception("Failed to fetch releases", error=str(e))
+            raise PlayStoreClientError(f"Failed to fetch releases: {e.reason}") from e
         finally:
             self._delete_edit(package_name, edit_id)
 
@@ -524,7 +589,7 @@ class PlayStoreClient:
 
         try:
             # Determine content type and upload method
-            is_bundle = file_path.endswith(".aab")
+            is_bundle = file_path.lower().endswith(".aab")
             content_type = (
                 "application/octet-stream"
                 if is_bundle
@@ -534,18 +599,16 @@ class PlayStoreClient:
             media = MediaFileUpload(file_path, mimetype=content_type, resumable=True)
 
             if is_bundle:
-                upload_response = (
+                upload_response = self._execute(
                     service.edits()
                     .bundles()
                     .upload(packageName=package_name, editId=edit_id, media_body=media)
-                    .execute()
                 )
             else:
-                upload_response = (
+                upload_response = self._execute(
                     service.edits()
                     .apks()
                     .upload(packageName=package_name, editId=edit_id, media_body=media)
-                    .execute()
                 )
 
             uploaded_version_code = int(upload_response.get("versionCode", 0))
@@ -577,12 +640,16 @@ class PlayStoreClient:
 
             # Update track
             track_body = {"releases": [release_body]}
-            service.edits().tracks().update(
-                packageName=package_name,
-                editId=edit_id,
-                track=track,
-                body=track_body,
-            ).execute()
+            self._execute(
+                service.edits()
+                .tracks()
+                .update(
+                    packageName=package_name,
+                    editId=edit_id,
+                    track=track,
+                    body=track_body,
+                )
+            )
 
             # Commit
             self._commit_edit(package_name, edit_id)
@@ -650,11 +717,10 @@ class PlayStoreClient:
 
         try:
             # Get source track info
-            source_track = (
+            source_track = self._execute(
                 service.edits()
                 .tracks()
                 .get(packageName=package_name, editId=edit_id, track=from_track)
-                .execute()
             )
 
             # Find the release with matching version code
@@ -666,6 +732,7 @@ class PlayStoreClient:
                     break
 
             if not source_release:
+                self._delete_edit(package_name, edit_id)
                 return DeploymentResult(
                     success=False,
                     package_name=package_name,
@@ -688,12 +755,16 @@ class PlayStoreClient:
                 new_release["status"] = "completed"
 
             # Update target track
-            service.edits().tracks().update(
-                packageName=package_name,
-                editId=edit_id,
-                track=to_track,
-                body={"releases": [new_release]},
-            ).execute()
+            self._execute(
+                service.edits()
+                .tracks()
+                .update(
+                    packageName=package_name,
+                    editId=edit_id,
+                    track=to_track,
+                    body={"releases": [new_release]},
+                )
+            )
 
             self._commit_edit(package_name, edit_id)
 
@@ -752,11 +823,8 @@ class PlayStoreClient:
 
         try:
             # Get current track info
-            current_track = (
-                service.edits()
-                .tracks()
-                .get(packageName=package_name, editId=edit_id, track=track)
-                .execute()
+            current_track = self._execute(
+                service.edits().tracks().get(packageName=package_name, editId=edit_id, track=track)
             )
 
             # Find and update the release
@@ -770,6 +838,7 @@ class PlayStoreClient:
                     break
 
             if not updated:
+                self._delete_edit(package_name, edit_id)
                 return DeploymentResult(
                     success=False,
                     package_name=package_name,
@@ -780,12 +849,16 @@ class PlayStoreClient:
                 )
 
             # Update track
-            service.edits().tracks().update(
-                packageName=package_name,
-                editId=edit_id,
-                track=track,
-                body={"releases": releases},
-            ).execute()
+            self._execute(
+                service.edits()
+                .tracks()
+                .update(
+                    packageName=package_name,
+                    editId=edit_id,
+                    track=track,
+                    body={"releases": releases},
+                )
+            )
 
             self._commit_edit(package_name, edit_id)
 
@@ -852,11 +925,8 @@ class PlayStoreClient:
 
         try:
             # Get current track info
-            current_track = (
-                service.edits()
-                .tracks()
-                .get(packageName=package_name, editId=edit_id, track=track)
-                .execute()
+            current_track = self._execute(
+                service.edits().tracks().get(packageName=package_name, editId=edit_id, track=track)
             )
 
             # Find and update the release
@@ -875,6 +945,7 @@ class PlayStoreClient:
                     break
 
             if not updated:
+                self._delete_edit(package_name, edit_id)
                 return DeploymentResult(
                     success=False,
                     package_name=package_name,
@@ -885,12 +956,16 @@ class PlayStoreClient:
                 )
 
             # Update track
-            service.edits().tracks().update(
-                packageName=package_name,
-                editId=edit_id,
-                track=track,
-                body={"releases": releases},
-            ).execute()
+            self._execute(
+                service.edits()
+                .tracks()
+                .update(
+                    packageName=package_name,
+                    editId=edit_id,
+                    track=track,
+                    body={"releases": releases},
+                )
+            )
 
             self._commit_edit(package_name, edit_id)
 
@@ -942,17 +1017,16 @@ class PlayStoreClient:
 
         try:
             # Get app details
-            details = (
-                service.edits().details().get(packageName=package_name, editId=edit_id).execute()
+            details = self._execute(
+                service.edits().details().get(packageName=package_name, editId=edit_id)
             )
 
             # Get listings for the specified language
             try:
-                listing = (
+                listing = self._execute(
                     service.edits()
                     .listings()
                     .get(packageName=package_name, editId=edit_id, language=language)
-                    .execute()
                 )
             except HttpError:
                 listing = {}
@@ -967,6 +1041,9 @@ class PlayStoreClient:
                 developer_email=details.get("contactEmail"),
                 developer_website=details.get("contactWebsite"),
             )
+        except HttpError as e:
+            self._logger.exception("Failed to fetch app details", error=str(e))
+            raise PlayStoreClientError(f"Failed to fetch app details: {e.reason}") from e
         finally:
             self._delete_edit(package_name, edit_id)
 
@@ -1003,7 +1080,7 @@ class PlayStoreClient:
                 kwargs["translationLanguage"] = translation_language
             request = service.reviews().list(**kwargs)
 
-            result = request.execute()
+            result = self._execute(request)
 
             reviews: list[Review] = []
             for review_data in result.get("reviews", []):
@@ -1040,7 +1117,7 @@ class PlayStoreClient:
             kwargs: dict[str, Any] = {"packageName": package_name, "reviewId": review_id}
             if translation_language:
                 kwargs["translationLanguage"] = translation_language
-            result = service.reviews().get(**kwargs).execute()
+            result = self._execute(service.reviews().get(**kwargs))
 
             review = _parse_review(result)
             if review is None:
@@ -1075,11 +1152,13 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.reviews().reply(
-                packageName=package_name,
-                reviewId=review_id,
-                body={"replyText": reply_text},
-            ).execute()
+            self._execute(
+                service.reviews().reply(
+                    packageName=package_name,
+                    reviewId=review_id,
+                    body={"replyText": reply_text},
+                )
+            )
 
             return ReviewReplyResult(
                 success=True,
@@ -1113,16 +1192,24 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = service.monetization().subscriptions().list(packageName=package_name).execute()
-
-            subscriptions = [
-                SubscriptionProduct(
-                    product_id=sub_data.get("productId", ""),
-                    package_name=package_name,
-                    base_plans=sub_data.get("basePlans", []),
+            subscriptions: list[SubscriptionProduct] = []
+            page_token: str | None = None
+            while True:
+                kwargs: dict[str, Any] = {"packageName": package_name}
+                if page_token:
+                    kwargs["pageToken"] = page_token
+                result = self._execute(service.monetization().subscriptions().list(**kwargs))
+                subscriptions.extend(
+                    SubscriptionProduct(
+                        product_id=sub_data.get("productId", ""),
+                        package_name=package_name,
+                        base_plans=sub_data.get("basePlans", []),
+                    )
+                    for sub_data in result.get("subscriptions", [])
                 )
-                for sub_data in result.get("subscriptions", [])
-            ]
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
 
             return subscriptions
 
@@ -1155,11 +1242,8 @@ class PlayStoreClient:
 
         try:
             # Use v2 API for subscriptions
-            result = (
-                service.purchases()
-                .subscriptionsv2()
-                .get(packageName=package_name, token=token)
-                .execute()
+            result = self._execute(
+                service.purchases().subscriptionsv2().get(packageName=package_name, token=token)
             )
 
             line_items = result.get("lineItems", [])
@@ -1169,12 +1253,27 @@ class PlayStoreClient:
                 for item in line_items
             )
 
+            # Expiry is per line item; use the one for this subscription. If no
+            # line item matches, the purchase isn't for this subscription id, so
+            # leave expiry unset rather than reporting another product's expiry
+            # (keeps it consistent with auto_renewing above).
+            expiry_raw = next(
+                (
+                    item.get("expiryTime")
+                    for item in line_items
+                    if item.get("productId") == subscription_id
+                ),
+                None,
+            )
+
             return SubscriptionPurchase(
                 package_name=package_name,
                 subscription_id=subscription_id,
                 purchase_token=token,
                 order_id=result.get("latestOrderId"),
                 auto_renewing=auto_renewing,
+                start_time=_parse_rfc3339(result.get("startTime")),
+                expiry_time=_parse_rfc3339(expiry_raw),
             )
 
         except HttpError as e:
@@ -1199,11 +1298,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.purchases()
                 .voidedpurchases()
                 .list(packageName=package_name, maxResults=max_results)
-                .execute()
             )
 
             voided = [
@@ -1250,11 +1348,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.purchases()
                 .products()
                 .get(packageName=package_name, productId=product_id, token=token)
-                .execute()
             )
 
             purchase_time = (
@@ -1307,12 +1404,16 @@ class PlayStoreClient:
         body = {"developerPayload": developer_payload} if developer_payload else {}
 
         try:
-            service.purchases().products().acknowledge(
-                packageName=package_name,
-                productId=product_id,
-                token=token,
-                body=body,
-            ).execute()
+            self._execute(
+                service.purchases()
+                .products()
+                .acknowledge(
+                    packageName=package_name,
+                    productId=product_id,
+                    token=token,
+                    body=body,
+                )
+            )
 
             return ProductPurchaseActionResult(
                 success=True,
@@ -1349,11 +1450,15 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.purchases().products().consume(
-                packageName=package_name,
-                productId=product_id,
-                token=token,
-            ).execute()
+            self._execute(
+                service.purchases()
+                .products()
+                .consume(
+                    packageName=package_name,
+                    productId=product_id,
+                    token=token,
+                )
+            )
 
             return ProductPurchaseActionResult(
                 success=True,
@@ -1388,9 +1493,9 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.orders().refund(
-                packageName=package_name, orderId=order_id, revoke=revoke
-            ).execute()
+            self._execute(
+                service.orders().refund(packageName=package_name, orderId=order_id, revoke=revoke)
+            )
 
             message = "Order refunded successfully"
             if revoke:
@@ -1428,11 +1533,15 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.purchases().subscriptionsv2().cancel(
-                packageName=package_name,
-                token=token,
-                body={"cancellationContext": {"cancellationType": cancellation_type}},
-            ).execute()
+            self._execute(
+                service.purchases()
+                .subscriptionsv2()
+                .cancel(
+                    packageName=package_name,
+                    token=token,
+                    body={"cancellationContext": {"cancellationType": cancellation_type}},
+                )
+            )
 
             return SubscriptionActionResult(
                 success=True,
@@ -1468,7 +1577,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.purchases()
                 .subscriptionsv2()
                 .defer(
@@ -1476,7 +1585,6 @@ class PlayStoreClient:
                     token=token,
                     body={"deferralContext": {"deferDuration": defer_duration, "etag": etag}},
                 )
-                .execute()
             )
 
             return SubscriptionActionResult(
@@ -1511,14 +1619,23 @@ class PlayStoreClient:
         self._logger.info(
             "Revoking subscription purchase", package_name=package_name, refund_type=refund_type
         )
+        if refund_type not in _REVOCATION_CONTEXTS:
+            raise PlayStoreClientError(
+                f"Invalid refund_type '{refund_type}'; must be one of: "
+                f"{', '.join(sorted(_REVOCATION_CONTEXTS))}"
+            )
         service = self._get_service()
 
         try:
-            service.purchases().subscriptionsv2().revoke(
-                packageName=package_name,
-                token=token,
-                body={"revocationContext": _REVOCATION_CONTEXTS[refund_type]},
-            ).execute()
+            self._execute(
+                service.purchases()
+                .subscriptionsv2()
+                .revoke(
+                    packageName=package_name,
+                    token=token,
+                    body={"revocationContext": _REVOCATION_CONTEXTS[refund_type]},
+                )
+            )
 
             return SubscriptionActionResult(
                 success=True,
@@ -1550,11 +1667,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.purchases()
                 .productsv2()
                 .getproductpurchasev2(packageName=package_name, token=token)
-                .execute()
             )
 
             return ProductPurchaseV2(
@@ -1722,7 +1838,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = service.inappproducts().list(packageName=package_name).execute()
+            result = self._execute(service.inappproducts().list(packageName=package_name))
 
             return [
                 self._parse_in_app_product(package_name, product_data)
@@ -1747,7 +1863,9 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            product_data = service.inappproducts().get(packageName=package_name, sku=sku).execute()
+            product_data = self._execute(
+                service.inappproducts().get(packageName=package_name, sku=sku)
+            )
             return self._parse_in_app_product(package_name, product_data)
 
         except HttpError as e:
@@ -1791,8 +1909,8 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
-                service.inappproducts().insert(packageName=package_name, body=product).execute()
+            result = self._execute(
+                service.inappproducts().insert(packageName=package_name, body=product)
             )
             return self._parse_in_app_product(package_name, result)
 
@@ -1823,15 +1941,13 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
-                service.inappproducts()
-                .update(
+            result = self._execute(
+                service.inappproducts().update(
                     packageName=package_name,
                     sku=sku,
                     autoConvertMissingPrices=auto_convert_missing_prices,
                     body=product,
                 )
-                .execute()
             )
             return self._parse_in_app_product(package_name, result)
 
@@ -1856,10 +1972,8 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
-                service.inappproducts()
-                .patch(packageName=package_name, sku=sku, body=product)
-                .execute()
+            result = self._execute(
+                service.inappproducts().patch(packageName=package_name, sku=sku, body=product)
             )
             return self._parse_in_app_product(package_name, result)
 
@@ -1881,7 +1995,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.inappproducts().delete(packageName=package_name, sku=sku).execute()
+            self._execute(service.inappproducts().delete(packageName=package_name, sku=sku))
 
             return InAppProductActionResult(
                 success=True,
@@ -1910,7 +2024,9 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = service.inappproducts().batchGet(packageName=package_name, sku=skus).execute()
+            result = self._execute(
+                service.inappproducts().batchGet(packageName=package_name, sku=skus)
+            )
 
             return [
                 self._parse_in_app_product(package_name, product_data)
@@ -1939,10 +2055,12 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.inappproducts().batchDelete(
-                packageName=package_name,
-                body={"requests": [{"packageName": package_name, "sku": s} for s in skus]},
-            ).execute()
+            self._execute(
+                service.inappproducts().batchDelete(
+                    packageName=package_name,
+                    body={"requests": [{"packageName": package_name, "sku": s} for s in skus]},
+                )
+            )
 
             return InAppProductActionResult(
                 success=True,
@@ -1987,11 +2105,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            data = (
+            data = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .get(packageName=package_name, productId=product_id)
-                .execute()
             )
             return self._parse_one_time_product(package_name, data)
 
@@ -2012,14 +2129,22 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
-                service.monetization().onetimeproducts().list(packageName=package_name).execute()
-            )
+            products: list[OneTimeProduct] = []
+            page_token: str | None = None
+            while True:
+                kwargs: dict[str, Any] = {"packageName": package_name}
+                if page_token:
+                    kwargs["pageToken"] = page_token
+                result = self._execute(service.monetization().onetimeproducts().list(**kwargs))
+                products.extend(
+                    self._parse_one_time_product(package_name, data)
+                    for data in result.get("oneTimeProducts", [])
+                )
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
 
-            return [
-                self._parse_one_time_product(package_name, data)
-                for data in result.get("oneTimeProducts", [])
-            ]
+            return products
 
         except HttpError as e:
             self._logger.exception("Failed to list one-time products", error=str(e))
@@ -2043,11 +2168,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .batchGet(packageName=package_name, productIds=product_ids)
-                .execute()
             )
 
             return [
@@ -2085,7 +2209,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .patch(
@@ -2095,7 +2219,6 @@ class PlayStoreClient:
                     regionsVersion_version=regions_version,
                     body=product,
                 )
-                .execute()
             )
             return self._parse_one_time_product(package_name, result)
 
@@ -2121,9 +2244,11 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.monetization().onetimeproducts().delete(
-                packageName=package_name, productId=product_id
-            ).execute()
+            self._execute(
+                service.monetization()
+                .onetimeproducts()
+                .delete(packageName=package_name, productId=product_id)
+            )
 
             return OneTimeProductActionResult(
                 success=True,
@@ -2154,11 +2279,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .batchUpdate(packageName=package_name, body={"requests": requests})
-                .execute()
             )
 
             return [
@@ -2190,9 +2314,11 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.monetization().onetimeproducts().batchDelete(
-                packageName=package_name, body={"requests": requests}
-            ).execute()
+            self._execute(
+                service.monetization()
+                .onetimeproducts()
+                .batchDelete(packageName=package_name, body={"requests": requests})
+            )
 
             return OneTimeProductActionResult(
                 success=True,
@@ -2233,11 +2359,16 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.monetization().onetimeproducts().purchaseOptions().batchDelete(
-                packageName=package_name,
-                productId=product_id,
-                body={"requests": requests},
-            ).execute()
+            self._execute(
+                service.monetization()
+                .onetimeproducts()
+                .purchaseOptions()
+                .batchDelete(
+                    packageName=package_name,
+                    productId=product_id,
+                    body={"requests": requests},
+                )
+            )
 
             return OneTimeProductActionResult(
                 success=True,
@@ -2275,7 +2406,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .purchaseOptions()
@@ -2284,7 +2415,6 @@ class PlayStoreClient:
                     productId=product_id,
                     body={"requests": requests},
                 )
-                .execute()
             )
 
             return [
@@ -2339,22 +2469,32 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
-                service.monetization()
-                .onetimeproducts()
-                .purchaseOptions()
-                .offers()
-                .list(
-                    packageName=package_name,
-                    productId=product_id,
-                    purchaseOptionId=purchase_option_id,
+            offers: list[OneTimeProductOffer] = []
+            page_token: str | None = None
+            while True:
+                kwargs: dict[str, Any] = {
+                    "packageName": package_name,
+                    "productId": product_id,
+                    "purchaseOptionId": purchase_option_id,
+                }
+                if page_token:
+                    kwargs["pageToken"] = page_token
+                result = self._execute(
+                    service.monetization()
+                    .onetimeproducts()
+                    .purchaseOptions()
+                    .offers()
+                    .list(**kwargs)
                 )
-                .execute()
-            )
-            return [
-                self._parse_one_time_product_offer(offer)
-                for offer in result.get("oneTimeProductOffers", [])
-            ]
+                offers.extend(
+                    self._parse_one_time_product_offer(offer)
+                    for offer in result.get("oneTimeProductOffers", [])
+                )
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+
+            return offers
 
         except HttpError as e:
             self._logger.exception("Failed to list purchase option offers", error=str(e))
@@ -2388,7 +2528,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .purchaseOptions()
@@ -2399,7 +2539,6 @@ class PlayStoreClient:
                     purchaseOptionId=purchase_option_id,
                     body={"requests": requests},
                 )
-                .execute()
             )
             return [
                 self._parse_one_time_product_offer(offer)
@@ -2436,7 +2575,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .purchaseOptions()
@@ -2453,7 +2592,6 @@ class PlayStoreClient:
                         "offerId": offer_id,
                     },
                 )
-                .execute()
             )
             return self._parse_one_time_product_offer(result)
 
@@ -2487,7 +2625,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .purchaseOptions()
@@ -2504,7 +2642,6 @@ class PlayStoreClient:
                         "offerId": offer_id,
                     },
                 )
-                .execute()
             )
             return self._parse_one_time_product_offer(result)
 
@@ -2538,7 +2675,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .purchaseOptions()
@@ -2555,7 +2692,6 @@ class PlayStoreClient:
                         "offerId": offer_id,
                     },
                 )
-                .execute()
             )
             return self._parse_one_time_product_offer(result)
 
@@ -2591,7 +2727,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .purchaseOptions()
@@ -2602,7 +2738,6 @@ class PlayStoreClient:
                     purchaseOptionId=purchase_option_id,
                     body={"requests": requests},
                 )
-                .execute()
             )
             return [
                 self._parse_one_time_product_offer(offer)
@@ -2644,7 +2779,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .onetimeproducts()
                 .purchaseOptions()
@@ -2655,7 +2790,6 @@ class PlayStoreClient:
                     purchaseOptionId=purchase_option_id,
                     body={"requests": requests},
                 )
-                .execute()
             )
             return [
                 self._parse_one_time_product_offer(offer)
@@ -2698,12 +2832,18 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.monetization().onetimeproducts().purchaseOptions().offers().batchDelete(
-                packageName=package_name,
-                productId=product_id,
-                purchaseOptionId=purchase_option_id,
-                body={"requests": requests},
-            ).execute()
+            self._execute(
+                service.monetization()
+                .onetimeproducts()
+                .purchaseOptions()
+                .offers()
+                .batchDelete(
+                    packageName=package_name,
+                    productId=product_id,
+                    purchaseOptionId=purchase_option_id,
+                    body={"requests": requests},
+                )
+            )
 
             return OneTimeProductActionResult(
                 success=True,
@@ -2746,11 +2886,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            data = (
+            data = self._execute(
                 service.monetization()
                 .subscriptions()
                 .get(packageName=package_name, productId=product_id)
-                .execute()
             )
             return self._parse_subscription(package_name, data)
 
@@ -2780,7 +2919,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .create(
@@ -2789,7 +2928,6 @@ class PlayStoreClient:
                     regionsVersion_version=regions_version,
                     body=subscription,
                 )
-                .execute()
             )
             return self._parse_subscription(package_name, result)
 
@@ -2821,7 +2959,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .patch(
@@ -2831,7 +2969,6 @@ class PlayStoreClient:
                     regionsVersion_version=regions_version,
                     body=subscription,
                 )
-                .execute()
             )
             return self._parse_subscription(package_name, result)
 
@@ -2853,9 +2990,11 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.monetization().subscriptions().delete(
-                packageName=package_name, productId=product_id
-            ).execute()
+            self._execute(
+                service.monetization()
+                .subscriptions()
+                .delete(packageName=package_name, productId=product_id)
+            )
 
             return SubscriptionCatalogResult(
                 success=True,
@@ -2886,11 +3025,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .batchGet(packageName=package_name, productIds=product_ids)
-                .execute()
             )
 
             return [
@@ -2920,11 +3058,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .batchUpdate(packageName=package_name, body={"requests": requests})
-                .execute()
             )
 
             return [
@@ -2962,7 +3099,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -2976,7 +3113,6 @@ class PlayStoreClient:
                         "basePlanId": base_plan_id,
                     },
                 )
-                .execute()
             )
             return self._parse_subscription(package_name, result)
 
@@ -3006,7 +3142,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3020,7 +3156,6 @@ class PlayStoreClient:
                         "basePlanId": base_plan_id,
                     },
                 )
-                .execute()
             )
             return self._parse_subscription(package_name, result)
 
@@ -3050,11 +3185,16 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.monetization().subscriptions().basePlans().delete(
-                packageName=package_name,
-                productId=product_id,
-                basePlanId=base_plan_id,
-            ).execute()
+            self._execute(
+                service.monetization()
+                .subscriptions()
+                .basePlans()
+                .delete(
+                    packageName=package_name,
+                    productId=product_id,
+                    basePlanId=base_plan_id,
+                )
+            )
 
             return SubscriptionCatalogResult(
                 success=True,
@@ -3094,7 +3234,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result: dict[str, Any] = (
+            result: dict[str, Any] = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3104,7 +3244,6 @@ class PlayStoreClient:
                     basePlanId=base_plan_id,
                     body=request,
                 )
-                .execute()
             )
             return result
 
@@ -3137,7 +3276,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result: dict[str, Any] = (
+            result: dict[str, Any] = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3146,7 +3285,6 @@ class PlayStoreClient:
                     productId=product_id,
                     body={"requests": requests},
                 )
-                .execute()
             )
             return result
 
@@ -3182,7 +3320,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3191,7 +3329,6 @@ class PlayStoreClient:
                     productId=product_id,
                     body={"requests": requests},
                 )
-                .execute()
             )
             return [
                 self._parse_subscription(package_name, sub)
@@ -3248,7 +3385,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            data = (
+            data = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3259,7 +3396,6 @@ class PlayStoreClient:
                     basePlanId=base_plan_id,
                     offerId=offer_id,
                 )
-                .execute()
             )
             return self._parse_subscription_offer(data)
 
@@ -3289,22 +3425,28 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
-                service.monetization()
-                .subscriptions()
-                .basePlans()
-                .offers()
-                .list(
-                    packageName=package_name,
-                    productId=product_id,
-                    basePlanId=base_plan_id,
+            offers: list[SubscriptionOffer] = []
+            page_token: str | None = None
+            while True:
+                kwargs: dict[str, Any] = {
+                    "packageName": package_name,
+                    "productId": product_id,
+                    "basePlanId": base_plan_id,
+                }
+                if page_token:
+                    kwargs["pageToken"] = page_token
+                result = self._execute(
+                    service.monetization().subscriptions().basePlans().offers().list(**kwargs)
                 )
-                .execute()
-            )
-            return [
-                self._parse_subscription_offer(offer)
-                for offer in result.get("subscriptionOffers", [])
-            ]
+                offers.extend(
+                    self._parse_subscription_offer(offer)
+                    for offer in result.get("subscriptionOffers", [])
+                )
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+
+            return offers
 
         except HttpError as e:
             self._logger.exception("Failed to list subscription offers", error=str(e))
@@ -3342,7 +3484,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3355,7 +3497,6 @@ class PlayStoreClient:
                     regionsVersion_version=regions_version,
                     body=offer,
                 )
-                .execute()
             )
             return self._parse_subscription_offer(result)
 
@@ -3397,7 +3538,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3411,7 +3552,6 @@ class PlayStoreClient:
                     regionsVersion_version=regions_version,
                     body=offer,
                 )
-                .execute()
             )
             return self._parse_subscription_offer(result)
 
@@ -3443,7 +3583,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3460,7 +3600,6 @@ class PlayStoreClient:
                         "offerId": offer_id,
                     },
                 )
-                .execute()
             )
             return self._parse_subscription_offer(result)
 
@@ -3492,7 +3631,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3509,7 +3648,6 @@ class PlayStoreClient:
                         "offerId": offer_id,
                     },
                 )
-                .execute()
             )
             return self._parse_subscription_offer(result)
 
@@ -3543,12 +3681,18 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.monetization().subscriptions().basePlans().offers().delete(
-                packageName=package_name,
-                productId=product_id,
-                basePlanId=base_plan_id,
-                offerId=offer_id,
-            ).execute()
+            self._execute(
+                service.monetization()
+                .subscriptions()
+                .basePlans()
+                .offers()
+                .delete(
+                    packageName=package_name,
+                    productId=product_id,
+                    basePlanId=base_plan_id,
+                    offerId=offer_id,
+                )
+            )
 
             return SubscriptionCatalogResult(
                 success=True,
@@ -3589,7 +3733,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3600,7 +3744,6 @@ class PlayStoreClient:
                     basePlanId=base_plan_id,
                     body={"requests": requests},
                 )
-                .execute()
             )
             return [
                 self._parse_subscription_offer(offer)
@@ -3641,7 +3784,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3652,7 +3795,6 @@ class PlayStoreClient:
                     basePlanId=base_plan_id,
                     body={"requests": requests},
                 )
-                .execute()
             )
             return [
                 self._parse_subscription_offer(offer)
@@ -3695,7 +3837,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.monetization()
                 .subscriptions()
                 .basePlans()
@@ -3706,7 +3848,6 @@ class PlayStoreClient:
                     basePlanId=base_plan_id,
                     body={"requests": requests},
                 )
-                .execute()
             )
             return [
                 self._parse_subscription_offer(offer)
@@ -3738,11 +3879,10 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            listing_data = (
+            listing_data = self._execute(
                 service.edits()
                 .listings()
                 .get(packageName=package_name, editId=edit_id, language=language)
-                .execute()
             )
 
             return Listing(
@@ -3752,6 +3892,9 @@ class PlayStoreClient:
                 short_description=listing_data.get("shortDescription"),
                 video=listing_data.get("video"),
             )
+        except HttpError as e:
+            self._logger.exception("Failed to get store listing", error=str(e))
+            raise PlayStoreClientError(f"Failed to get store listing: {e.reason}") from e
         finally:
             self._delete_edit(package_name, edit_id)
 
@@ -3784,11 +3927,10 @@ class PlayStoreClient:
         try:
             # Get current listing
             try:
-                current_listing = (
+                current_listing = self._execute(
                     service.edits()
                     .listings()
                     .get(packageName=package_name, editId=edit_id, language=language)
-                    .execute()
                 )
             except HttpError:
                 current_listing = {}
@@ -3814,12 +3956,16 @@ class PlayStoreClient:
                 update_body["video"] = video
 
             # Update listing
-            service.edits().listings().update(
-                packageName=package_name,
-                editId=edit_id,
-                language=language,
-                body=update_body,
-            ).execute()
+            self._execute(
+                service.edits()
+                .listings()
+                .update(
+                    packageName=package_name,
+                    editId=edit_id,
+                    language=language,
+                    body=update_body,
+                )
+            )
 
             self._commit_edit(package_name, edit_id)
 
@@ -3865,8 +4011,8 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            result = (
-                service.edits().listings().list(packageName=package_name, editId=edit_id).execute()
+            result = self._execute(
+                service.edits().listings().list(packageName=package_name, editId=edit_id)
             )
 
             listings: list[Listing] = [
@@ -3881,6 +4027,9 @@ class PlayStoreClient:
             ]
 
             return listings
+        except HttpError as e:
+            self._logger.exception("Failed to list store listings", error=str(e))
+            raise PlayStoreClientError(f"Failed to list store listings: {e.reason}") from e
         finally:
             self._delete_edit(package_name, edit_id)
 
@@ -3903,11 +4052,8 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            testers_data = (
-                service.edits()
-                .testers()
-                .get(packageName=package_name, editId=edit_id, track=track)
-                .execute()
+            testers_data = self._execute(
+                service.edits().testers().get(packageName=package_name, editId=edit_id, track=track)
             )
 
             return TesterInfo(
@@ -3949,18 +4095,26 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            service.edits().testers().update(
-                packageName=package_name,
-                editId=edit_id,
-                track=track,
-                body={"googleGroups": google_groups},
-            ).execute()
+            self._execute(
+                service.edits()
+                .testers()
+                .update(
+                    packageName=package_name,
+                    editId=edit_id,
+                    track=track,
+                    body={"googleGroups": google_groups},
+                )
+            )
 
             self._commit_edit(package_name, edit_id)
 
             return {"success": True, "track": track, "google_groups": google_groups}
 
         except HttpError as e:
+            self._logger.exception("Failed to update testers", error=str(e))
+            self._delete_edit(package_name, edit_id)
+            return {"success": False, "track": track, "error": str(e)}
+        except Exception as e:
             self._logger.exception("Failed to update testers", error=str(e))
             self._delete_edit(package_name, edit_id)
             return {"success": False, "track": track, "error": str(e)}
@@ -3983,7 +4137,9 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            order_data = service.orders().get(packageName=package_name, orderId=order_id).execute()
+            order_data = self._execute(
+                service.orders().get(packageName=package_name, orderId=order_id)
+            )
 
             return Order(
                 order_id=order_id,
@@ -4012,8 +4168,8 @@ class PlayStoreClient:
 
         try:
             # NOTE: googleapiclient method is lowercase "batchget" (per the discovery doc).
-            result = (
-                service.orders().batchget(packageName=package_name, orderIds=order_ids).execute()
+            result = self._execute(
+                service.orders().batchget(packageName=package_name, orderIds=order_ids)
             )
 
             return [
@@ -4061,7 +4217,7 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            expansion_data = (
+            expansion_data = self._execute(
                 service.edits()
                 .expansionfiles()
                 .get(
@@ -4070,7 +4226,6 @@ class PlayStoreClient:
                     apkVersionCode=version_code,
                     expansionFileType=expansion_file_type,
                 )
-                .execute()
             )
 
             return ExpansionFile(
@@ -4110,7 +4265,9 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            result = service.edits().apks().list(packageName=package_name, editId=edit_id).execute()
+            result = self._execute(
+                service.edits().apks().list(packageName=package_name, editId=edit_id)
+            )
             apks: list[Apk] = []
             for apk_data in result.get("apks", []):
                 binary = apk_data.get("binary") or {}
@@ -4123,6 +4280,9 @@ class PlayStoreClient:
                     )
                 )
             return apks
+        except HttpError as e:
+            self._logger.exception("Failed to list APKs", error=str(e))
+            raise PlayStoreClientError(f"Failed to list APKs: {e.reason}") from e
         finally:
             self._delete_edit(package_name, edit_id)
 
@@ -4140,8 +4300,8 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            result = (
-                service.edits().bundles().list(packageName=package_name, editId=edit_id).execute()
+            result = self._execute(
+                service.edits().bundles().list(packageName=package_name, editId=edit_id)
             )
             return [
                 Bundle(
@@ -4152,6 +4312,9 @@ class PlayStoreClient:
                 )
                 for bundle_data in result.get("bundles", [])
             ]
+        except HttpError as e:
+            self._logger.exception("Failed to list bundles", error=str(e))
+            raise PlayStoreClientError(f"Failed to list bundles: {e.reason}") from e
         finally:
             self._delete_edit(package_name, edit_id)
 
@@ -4175,11 +4338,10 @@ class PlayStoreClient:
                 mimetype="application/vnd.android.package-archive",
                 resumable=True,
             )
-            data = (
+            data = self._execute(
                 service.edits()
                 .apks()
                 .upload(packageName=package_name, editId=edit_id, media_body=media)
-                .execute()
             )
             self._commit_edit(package_name, edit_id)
             binary = data.get("binary") or {}
@@ -4193,6 +4355,10 @@ class PlayStoreClient:
             self._logger.exception("Failed to upload APK", error=str(e))
             self._delete_edit(package_name, edit_id)
             raise PlayStoreClientError(f"Failed to upload APK: {e.reason}") from e
+        except Exception as e:
+            self._logger.exception("Failed to upload APK", error=str(e))
+            self._delete_edit(package_name, edit_id)
+            raise PlayStoreClientError(f"Failed to upload APK: {e}") from e
 
     def upload_bundle(self, package_name: str, bundle_path: str) -> Bundle:
         """Upload an app bundle (.aab) to a new edit and commit it.
@@ -4214,11 +4380,10 @@ class PlayStoreClient:
                 mimetype="application/octet-stream",
                 resumable=True,
             )
-            data = (
+            data = self._execute(
                 service.edits()
                 .bundles()
                 .upload(packageName=package_name, editId=edit_id, media_body=media)
-                .execute()
             )
             self._commit_edit(package_name, edit_id)
             return Bundle(
@@ -4231,6 +4396,10 @@ class PlayStoreClient:
             self._logger.exception("Failed to upload bundle", error=str(e))
             self._delete_edit(package_name, edit_id)
             raise PlayStoreClientError(f"Failed to upload bundle: {e.reason}") from e
+        except Exception as e:
+            self._logger.exception("Failed to upload bundle", error=str(e))
+            self._delete_edit(package_name, edit_id)
+            raise PlayStoreClientError(f"Failed to upload bundle: {e}") from e
 
     def upload_deobfuscation_file(
         self,
@@ -4261,7 +4430,7 @@ class PlayStoreClient:
 
         try:
             media = MediaFileUpload(file_path, mimetype="application/octet-stream", resumable=True)
-            data = (
+            data = self._execute(
                 service.edits()
                 .deobfuscationfiles()
                 .upload(
@@ -4271,7 +4440,6 @@ class PlayStoreClient:
                     deobfuscationFileType=deobfuscation_file_type,
                     media_body=media,
                 )
-                .execute()
             )
             self._commit_edit(package_name, edit_id)
             deobfuscation_file = data.get("deobfuscationFile") or {}
@@ -4284,6 +4452,10 @@ class PlayStoreClient:
             self._logger.exception("Failed to upload deobfuscation file", error=str(e))
             self._delete_edit(package_name, edit_id)
             raise PlayStoreClientError(f"Failed to upload deobfuscation file: {e.reason}") from e
+        except Exception as e:
+            self._logger.exception("Failed to upload deobfuscation file", error=str(e))
+            self._delete_edit(package_name, edit_id)
+            raise PlayStoreClientError(f"Failed to upload deobfuscation file: {e}") from e
 
     def upload_expansion_file(
         self,
@@ -4314,7 +4486,7 @@ class PlayStoreClient:
 
         try:
             media = MediaFileUpload(file_path, mimetype="application/octet-stream", resumable=True)
-            data = (
+            data = self._execute(
                 service.edits()
                 .expansionfiles()
                 .upload(
@@ -4324,7 +4496,6 @@ class PlayStoreClient:
                     expansionFileType=expansion_file_type,
                     media_body=media,
                 )
-                .execute()
             )
             self._commit_edit(package_name, edit_id)
             expansion_file = data.get("expansionFile") or {}
@@ -4338,6 +4509,10 @@ class PlayStoreClient:
             self._logger.exception("Failed to upload expansion file", error=str(e))
             self._delete_edit(package_name, edit_id)
             raise PlayStoreClientError(f"Failed to upload expansion file: {e.reason}") from e
+        except Exception as e:
+            self._logger.exception("Failed to upload expansion file", error=str(e))
+            self._delete_edit(package_name, edit_id)
+            raise PlayStoreClientError(f"Failed to upload expansion file: {e}") from e
 
     # =========================================================================
     # Store Listing Images API (edits.images)
@@ -4387,7 +4562,7 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            result = (
+            result = self._execute(
                 service.edits()
                 .images()
                 .list(
@@ -4396,12 +4571,14 @@ class PlayStoreClient:
                     language=language,
                     imageType=image_type,
                 )
-                .execute()
             )
             return [
                 self._parse_app_image(package_name, language, image_type, image_data)
                 for image_data in result.get("images", [])
             ]
+        except HttpError as e:
+            self._logger.exception("Failed to list images", error=str(e))
+            raise PlayStoreClientError(f"Failed to list images: {e.reason}") from e
         finally:
             self._delete_edit(package_name, edit_id)
 
@@ -4436,7 +4613,7 @@ class PlayStoreClient:
         try:
             mimetype = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
             media = MediaFileUpload(image_path, mimetype=mimetype, resumable=True)
-            data = (
+            data = self._execute(
                 service.edits()
                 .images()
                 .upload(
@@ -4446,7 +4623,6 @@ class PlayStoreClient:
                     imageType=image_type,
                     media_body=media,
                 )
-                .execute()
             )
             self._commit_edit(package_name, edit_id)
             image = data.get("image") or {}
@@ -4455,6 +4631,10 @@ class PlayStoreClient:
             self._logger.exception("Failed to upload image", error=str(e))
             self._delete_edit(package_name, edit_id)
             raise PlayStoreClientError(f"Failed to upload image: {e.reason}") from e
+        except Exception as e:
+            self._logger.exception("Failed to upload image", error=str(e))
+            self._delete_edit(package_name, edit_id)
+            raise PlayStoreClientError(f"Failed to upload image: {e}") from e
 
     def delete_image(
         self,
@@ -4485,13 +4665,17 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            service.edits().images().delete(
-                packageName=package_name,
-                editId=edit_id,
-                language=language,
-                imageType=image_type,
-                imageId=image_id,
-            ).execute()
+            self._execute(
+                service.edits()
+                .images()
+                .delete(
+                    packageName=package_name,
+                    editId=edit_id,
+                    language=language,
+                    imageType=image_type,
+                    imageId=image_id,
+                )
+            )
             self._commit_edit(package_name, edit_id)
             return ImageDeleteResult(
                 success=True,
@@ -4505,6 +4689,10 @@ class PlayStoreClient:
             self._logger.exception("Failed to delete image", error=str(e))
             self._delete_edit(package_name, edit_id)
             raise PlayStoreClientError(f"Failed to delete image: {e.reason}") from e
+        except Exception as e:
+            self._logger.exception("Failed to delete image", error=str(e))
+            self._delete_edit(package_name, edit_id)
+            raise PlayStoreClientError(f"Failed to delete image: {e}") from e
 
     def delete_all_images(
         self,
@@ -4532,7 +4720,7 @@ class PlayStoreClient:
         edit_id = self._create_edit(package_name)
 
         try:
-            result = (
+            result = self._execute(
                 service.edits()
                 .images()
                 .deleteall(
@@ -4541,7 +4729,6 @@ class PlayStoreClient:
                     language=language,
                     imageType=image_type,
                 )
-                .execute()
             )
             self._commit_edit(package_name, edit_id)
             deleted_count = len(result.get("deleted", []))
@@ -4557,6 +4744,10 @@ class PlayStoreClient:
             self._logger.exception("Failed to delete all images", error=str(e))
             self._delete_edit(package_name, edit_id)
             raise PlayStoreClientError(f"Failed to delete all images: {e.reason}") from e
+        except Exception as e:
+            self._logger.exception("Failed to delete all images", error=str(e))
+            self._delete_edit(package_name, edit_id)
+            raise PlayStoreClientError(f"Failed to delete all images: {e}") from e
 
     # =========================================================================
     # External Transactions API (alternative billing)
@@ -4606,7 +4797,7 @@ class PlayStoreClient:
         name = f"applications/{package_name}/externalTransactions/{external_transaction_id}"
 
         try:
-            data = service.externaltransactions().getexternaltransaction(name=name).execute()
+            data = self._execute(service.externaltransactions().getexternaltransaction(name=name))
             return self._parse_external_transaction(package_name, external_transaction_id, data)
 
         except HttpError as e:
@@ -4638,14 +4829,12 @@ class PlayStoreClient:
         parent = f"applications/{package_name}"
 
         try:
-            data = (
-                service.externaltransactions()
-                .createexternaltransaction(
+            data = self._execute(
+                service.externaltransactions().createexternaltransaction(
                     parent=parent,
                     externalTransactionId=external_transaction_id,
                     body=transaction,
                 )
-                .execute()
             )
             return self._parse_external_transaction(package_name, external_transaction_id, data)
 
@@ -4679,10 +4868,8 @@ class PlayStoreClient:
         name = f"applications/{package_name}/externalTransactions/{external_transaction_id}"
 
         try:
-            data = (
-                service.externaltransactions()
-                .refundexternaltransaction(name=name, body=refund)
-                .execute()
+            data = self._execute(
+                service.externaltransactions().refundexternaltransaction(name=name, body=refund)
             )
             return self._parse_external_transaction(package_name, external_transaction_id, data)
 
@@ -4727,11 +4914,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            data = (
+            data = self._execute(
                 service.applications()
                 .deviceTierConfigs()
                 .get(packageName=package_name, deviceTierConfigId=device_tier_config_id)
-                .execute()
             )
             return self._parse_device_tier_config(package_name, data)
 
@@ -4752,14 +4938,22 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
-                service.applications().deviceTierConfigs().list(packageName=package_name).execute()
-            )
+            configs: list[DeviceTierConfig] = []
+            page_token: str | None = None
+            while True:
+                kwargs: dict[str, Any] = {"packageName": package_name}
+                if page_token:
+                    kwargs["pageToken"] = page_token
+                result = self._execute(service.applications().deviceTierConfigs().list(**kwargs))
+                configs.extend(
+                    self._parse_device_tier_config(package_name, config_data)
+                    for config_data in result.get("deviceTierConfigs", [])
+                )
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
 
-            return [
-                self._parse_device_tier_config(package_name, config_data)
-                for config_data in result.get("deviceTierConfigs", [])
-            ]
+            return configs
 
         except HttpError as e:
             self._logger.exception("Failed to list device tier configs", error=str(e))
@@ -4787,7 +4981,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            data = (
+            data = self._execute(
                 service.applications()
                 .deviceTierConfigs()
                 .create(
@@ -4795,7 +4989,6 @@ class PlayStoreClient:
                     allowUnknownDevices=allow_unknown_devices,
                     body=config,
                 )
-                .execute()
             )
             return self._parse_device_tier_config(package_name, data)
 
@@ -4857,11 +5050,22 @@ class PlayStoreClient:
         parent = f"developers/{developer_id}"
 
         try:
-            result = service.users().list(parent=parent).execute()
+            users: list[User] = []
+            page_token: str | None = None
+            while True:
+                kwargs: dict[str, Any] = {"parent": parent}
+                if page_token:
+                    kwargs["pageToken"] = page_token
+                result = self._execute(service.users().list(**kwargs))
+                users.extend(
+                    self._parse_user(developer_id, user_data)
+                    for user_data in result.get("users", [])
+                )
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
 
-            return [
-                self._parse_user(developer_id, user_data) for user_data in result.get("users", [])
-            ]
+            return users
 
         except HttpError as e:
             self._logger.exception("Failed to list users", error=str(e))
@@ -4883,7 +5087,7 @@ class PlayStoreClient:
         parent = f"developers/{developer_id}"
 
         try:
-            data = service.users().create(parent=parent, body=user).execute()
+            data = self._execute(service.users().create(parent=parent, body=user))
             return self._parse_user(developer_id, data)
 
         except HttpError as e:
@@ -4914,7 +5118,9 @@ class PlayStoreClient:
         name = f"developers/{developer_id}/users/{email}"
 
         try:
-            data = service.users().patch(name=name, updateMask=update_mask, body=user).execute()
+            data = self._execute(
+                service.users().patch(name=name, updateMask=update_mask, body=user)
+            )
             return self._parse_user(developer_id, data)
 
         except HttpError as e:
@@ -4936,7 +5142,7 @@ class PlayStoreClient:
         name = f"developers/{developer_id}/users/{email}"
 
         try:
-            service.users().delete(name=name).execute()
+            self._execute(service.users().delete(name=name))
 
             return AccessResult(
                 success=True,
@@ -4963,7 +5169,7 @@ class PlayStoreClient:
         parent = f"developers/{developer_id}/users/{email}"
 
         try:
-            data = service.grants().create(parent=parent, body=grant).execute()
+            data = self._execute(service.grants().create(parent=parent, body=grant))
             return self._parse_grant(developer_id, email, data)
 
         except HttpError as e:
@@ -5001,7 +5207,9 @@ class PlayStoreClient:
         name = f"developers/{developer_id}/users/{email}/grants/{package_name}"
 
         try:
-            data = service.grants().patch(name=name, updateMask=update_mask, body=grant).execute()
+            data = self._execute(
+                service.grants().patch(name=name, updateMask=update_mask, body=grant)
+            )
             return self._parse_grant(developer_id, email, data)
 
         except HttpError as e:
@@ -5029,7 +5237,7 @@ class PlayStoreClient:
         name = f"developers/{developer_id}/users/{email}/grants/{package_name}"
 
         try:
-            service.grants().delete(name=name).execute()
+            self._execute(service.grants().delete(name=name))
 
             return AccessResult(
                 success=True,
@@ -5063,10 +5271,12 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.applications().dataSafety(
-                packageName=package_name,
-                body=safety_labels,
-            ).execute()
+            self._execute(
+                service.applications().dataSafety(
+                    packageName=package_name,
+                    body=safety_labels,
+                )
+            )
             return DataSafetyResult(
                 success=True,
                 package_name=package_name,
@@ -5092,20 +5302,26 @@ class PlayStoreClient:
             create_time=data.get("createTime"),
         )
 
-    def list_app_recoveries(self, package_name: str) -> list[AppRecovery]:
-        """List app recovery actions for an app.
+    def list_app_recoveries(self, package_name: str, version_code: int) -> list[AppRecovery]:
+        """List app recovery actions for an app version.
 
         Args:
             package_name: App package name.
+            version_code: App version code the recovery actions target (required
+                by the API).
 
         Returns:
             List of app recovery actions.
         """
-        self._logger.info("Listing app recoveries", package_name=package_name)
+        self._logger.info(
+            "Listing app recoveries", package_name=package_name, version_code=version_code
+        )
         service = self._get_service()
 
         try:
-            result = service.apprecovery().list(packageName=package_name).execute()
+            result = self._execute(
+                service.apprecovery().list(packageName=package_name, versionCode=version_code)
+            )
 
             return [
                 self._parse_app_recovery(package_name, recovery_data)
@@ -5135,7 +5351,9 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            data = service.apprecovery().create(packageName=package_name, body=recovery).execute()
+            data = self._execute(
+                service.apprecovery().create(packageName=package_name, body=recovery)
+            )
             return self._parse_app_recovery(package_name, data)
 
         except HttpError as e:
@@ -5164,11 +5382,13 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.apprecovery().deploy(
-                packageName=package_name,
-                appRecoveryId=app_recovery_id,
-                body={},
-            ).execute()
+            self._execute(
+                service.apprecovery().deploy(
+                    packageName=package_name,
+                    appRecoveryId=app_recovery_id,
+                    body={},
+                )
+            )
             return AppRecoveryResult(
                 success=True,
                 package_name=package_name,
@@ -5202,11 +5422,13 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.apprecovery().cancel(
-                packageName=package_name,
-                appRecoveryId=app_recovery_id,
-                body={},
-            ).execute()
+            self._execute(
+                service.apprecovery().cancel(
+                    packageName=package_name,
+                    appRecoveryId=app_recovery_id,
+                    body={},
+                )
+            )
             return AppRecoveryResult(
                 success=True,
                 package_name=package_name,
@@ -5243,11 +5465,13 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            service.apprecovery().addTargeting(
-                packageName=package_name,
-                appRecoveryId=app_recovery_id,
-                body=targeting,
-            ).execute()
+            self._execute(
+                service.apprecovery().addTargeting(
+                    packageName=package_name,
+                    appRecoveryId=app_recovery_id,
+                    body=targeting,
+                )
+            )
             return AppRecoveryResult(
                 success=True,
                 package_name=package_name,
@@ -5289,10 +5513,8 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
-                service.generatedapks()
-                .list(packageName=package_name, versionCode=version_code)
-                .execute()
+            result = self._execute(
+                service.generatedapks().list(packageName=package_name, versionCode=version_code)
             )
 
             downloads: list[GeneratedApksDownload] = []
@@ -5390,6 +5612,11 @@ class PlayStoreClient:
         except HttpError as e:
             self._logger.exception("Failed to download generated APK", error=str(e))
             raise PlayStoreClientError(f"Failed to download generated APK: {e.reason}") from e
+        except OSError as e:
+            self._logger.exception("Failed to write generated APK", error=str(e))
+            raise PlayStoreClientError(
+                f"Failed to write generated APK to {destination_path}: {e}"
+            ) from e
 
     # =========================================================================
     # System APK Variants API
@@ -5435,7 +5662,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            data = (
+            data = self._execute(
                 service.systemapks()
                 .variants()
                 .get(
@@ -5443,7 +5670,6 @@ class PlayStoreClient:
                     versionCode=version_code,
                     variantId=variant_id,
                 )
-                .execute()
             )
             return self._parse_system_apk_variant(package_name, version_code, data)
 
@@ -5473,11 +5699,10 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            result = (
+            result = self._execute(
                 service.systemapks()
                 .variants()
                 .list(packageName=package_name, versionCode=version_code)
-                .execute()
             )
 
             return [
@@ -5513,7 +5738,7 @@ class PlayStoreClient:
         service = self._get_service()
 
         try:
-            data = (
+            data = self._execute(
                 service.systemapks()
                 .variants()
                 .create(
@@ -5521,7 +5746,6 @@ class PlayStoreClient:
                     versionCode=version_code,
                     body=variant,
                 )
-                .execute()
             )
             return self._parse_system_apk_variant(package_name, version_code, data)
 
@@ -5584,6 +5808,11 @@ class PlayStoreClient:
         except HttpError as e:
             self._logger.exception("Failed to download system APK variant", error=str(e))
             raise PlayStoreClientError(f"Failed to download system APK variant: {e.reason}") from e
+        except OSError as e:
+            self._logger.exception("Failed to write system APK variant", error=str(e))
+            raise PlayStoreClientError(
+                f"Failed to write system APK variant to {destination_path}: {e}"
+            ) from e
 
     # =========================================================================
     # Internal App Sharing API
@@ -5629,10 +5858,10 @@ class PlayStoreClient:
                 mimetype="application/vnd.android.package-archive",
                 resumable=True,
             )
-            data = (
-                service.internalappsharingartifacts()
-                .uploadapk(packageName=package_name, media_body=media)
-                .execute()
+            data = self._execute(
+                service.internalappsharingartifacts().uploadapk(
+                    packageName=package_name, media_body=media
+                )
             )
             return self._parse_internal_app_sharing_artifact(package_name, data)
 
@@ -5669,10 +5898,10 @@ class PlayStoreClient:
                 mimetype="application/octet-stream",
                 resumable=True,
             )
-            data = (
-                service.internalappsharingartifacts()
-                .uploadbundle(packageName=package_name, media_body=media)
-                .execute()
+            data = self._execute(
+                service.internalappsharingartifacts().uploadbundle(
+                    packageName=package_name, media_body=media
+                )
             )
             return self._parse_internal_app_sharing_artifact(package_name, data)
 
