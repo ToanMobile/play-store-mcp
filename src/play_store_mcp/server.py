@@ -25,7 +25,10 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from play_store_mcp.analytics_client import AnalyticsDataClient
+from play_store_mcp.bigquery_client import BigQueryClient
 from play_store_mcp.client import PlayStoreClient, PlayStoreClientError
+from play_store_mcp.reporting_client import ReportingClient, _parse_reporting_rows
 
 # Configure structured logging to stderr (stdout is reserved for MCP JSON-RPC)
 log_level = os.environ.get("PLAY_STORE_MCP_LOG_LEVEL", "INFO")
@@ -81,11 +84,63 @@ def get_client_from_context() -> PlayStoreClient:
     )
 
 
+def get_reporting_client_from_context() -> ReportingClient:
+    """Resolve a ReportingClient (Android Vitals: crash/ANR) for the current request.
+
+    Vitals require the Reporting API scope, which is separate from the
+    Publisher API scope PlayStoreClient uses, so this is intentionally a
+    distinct client/credential path rather than reusing get_client_from_context.
+    """
+    reporting_client: ReportingClient | None = _shared_state.get("reporting_client")
+    if reporting_client is not None:
+        return reporting_client
+
+    reporting_client = ReportingClient()
+    _shared_state["reporting_client"] = reporting_client
+    return reporting_client
+
+
+def get_bigquery_client_from_context() -> BigQueryClient:
+    """Resolve a BigQueryClient (raw event/crash/session data) for the current request.
+
+    BigQuery requires the bigquery.readonly scope, separate from the Publisher
+    and Reporting API scopes, so this is its own client/credential path.
+    """
+    bigquery_client: BigQueryClient | None = _shared_state.get("bigquery_client")
+    if bigquery_client is not None:
+        return bigquery_client
+
+    bigquery_client = BigQueryClient()
+    _shared_state["bigquery_client"] = bigquery_client
+    return bigquery_client
+
+
+def get_analytics_client_from_context() -> AnalyticsDataClient:
+    """Resolve an AnalyticsDataClient (GA4 aggregated reports) for the current request.
+
+    Requires the analytics.readonly scope, separate from the other clients'
+    scopes, so this is its own client/credential path.
+    """
+    analytics_client: AnalyticsDataClient | None = _shared_state.get("analytics_client")
+    if analytics_client is not None:
+        return analytics_client
+
+    analytics_client = AnalyticsDataClient()
+    _shared_state["analytics_client"] = analytics_client
+    return analytics_client
+
+
 # Shared fallback client, used when a request carries no per-request
 # credential header. Populated by the lifespan on startup and swapped by the
 # /credentials route. Module-level so custom routes and get_client_from_context
 # can reach it without depending on framework-internal context plumbing.
-_shared_state: dict[str, Any] = {"client": None, "credentials_updated": False}
+_shared_state: dict[str, Any] = {
+    "client": None,
+    "credentials_updated": False,
+    "reporting_client": None,
+    "bigquery_client": None,
+    "analytics_client": None,
+}
 
 
 @asynccontextmanager
@@ -515,6 +570,270 @@ def reply_to_review(
     )
 
     return result.model_dump()
+
+
+# =============================================================================
+# Vitals Tools (crash / ANR — Play Developer Reporting API)
+# =============================================================================
+#
+# Ported from AgiMaulana/GooglePlayConsoleMcp (MIT licensed), rewired onto
+# ReportingClient/PlayStoreClientError instead of a bare AuthorizedSession.
+# Requires the service account to have the "View app quality data"
+# permission in Play Console (separate from the Publisher API's Release
+# Manager role) and the Reporting API scope/enablement at the GCP project.
+
+
+@mcp.tool()
+def get_crash_rate(
+    package_name: str,
+    days: int = 7,
+    version_code: str = "",
+) -> dict[str, Any]:
+    """Fetch daily crash rate from Android Vitals.
+
+    Returns crashRate, userPerceivedCrashRate, and distinctUsers by version
+    code. Bad-behavior threshold: userPerceivedCrashRate > 1.09%.
+
+    Args:
+        package_name: App package name
+        days: Past days to include (default 7, max 365)
+        version_code: Optional version code filter
+    """
+    days = max(1, min(days, 365))
+    client = get_reporting_client_from_context()
+    raw = client.query_crash_rate(package_name, days, version_code or None)
+    rows = _parse_reporting_rows(raw.get("rows", []))
+    return {
+        "packageName": package_name,
+        "periodDays": days,
+        "badBehaviorThreshold": {"userPerceivedCrashRate": 0.0109},
+        "rows": rows,
+    }
+
+
+@mcp.tool()
+def get_anr_rate(
+    package_name: str,
+    days: int = 7,
+    version_code: str = "",
+) -> dict[str, Any]:
+    """Fetch daily ANR (Application Not Responding) rate from Android Vitals.
+
+    Returns anrRate, userPerceivedAnrRate, and distinctUsers by version code.
+    Bad-behavior threshold: userPerceivedAnrRate > 0.47%.
+
+    Args:
+        package_name: App package name
+        days: Past days to include (default 7, max 365)
+        version_code: Optional version code filter
+    """
+    days = max(1, min(days, 365))
+    client = get_reporting_client_from_context()
+    raw = client.query_anr_rate(package_name, days, version_code or None)
+    rows = _parse_reporting_rows(raw.get("rows", []))
+    return {
+        "packageName": package_name,
+        "periodDays": days,
+        "badBehaviorThreshold": {"userPerceivedAnrRate": 0.0047},
+        "rows": rows,
+    }
+
+
+@mcp.tool()
+def get_wakelock_rate(
+    package_name: str,
+    days: int = 7,
+    version_code: str = "",
+) -> dict[str, Any]:
+    """Fetch stuck background wake lock rate from Android Vitals.
+
+    Args:
+        package_name: App package name
+        days: Past days to include (default 7, max 365)
+        version_code: Optional version code filter
+    """
+    days = max(1, min(days, 365))
+    client = get_reporting_client_from_context()
+    raw = client.query_wakelock_rate(package_name, days, version_code or None)
+    rows = _parse_reporting_rows(raw.get("rows", []))
+    return {"packageName": package_name, "periodDays": days, "rows": rows}
+
+
+@mcp.tool()
+def get_wakeup_rate(
+    package_name: str,
+    days: int = 7,
+    version_code: str = "",
+) -> dict[str, Any]:
+    """Fetch excessive CPU wakeup rate from Android Vitals.
+
+    Args:
+        package_name: App package name
+        days: Past days to include (default 7, max 365)
+        version_code: Optional version code filter
+    """
+    days = max(1, min(days, 365))
+    client = get_reporting_client_from_context()
+    raw = client.query_wakeup_rate(package_name, days, version_code or None)
+    rows = _parse_reporting_rows(raw.get("rows", []))
+    return {"packageName": package_name, "periodDays": days, "rows": rows}
+
+
+@mcp.tool()
+def get_vitals_summary(
+    package_name: str,
+    days: int = 7,
+) -> dict[str, Any]:
+    """Get combined Android Vitals: crash rate and ANR rate per version code.
+
+    Returns per-version averages over the period with bad-behavior threshold
+    flags (userPerceivedCrashRate > 1.09%, userPerceivedAnrRate > 0.47%).
+
+    Args:
+        package_name: App package name
+        days: Past days to include (default 7, max 365)
+    """
+    days = max(1, min(days, 365))
+    client = get_reporting_client_from_context()
+    crash_rows = _parse_reporting_rows(client.query_crash_rate(package_name, days).get("rows", []))
+    anr_rows = _parse_reporting_rows(client.query_anr_rate(package_name, days).get("rows", []))
+
+    def _aggregate(rows: list[dict[str, Any]], rate_key: str, perceived_key: str) -> dict[str, Any]:
+        by_version: dict[str, Any] = {}
+        for row in rows:
+            vc = row.get("versionCode") or "unknown"
+            entry = by_version.setdefault(vc, {"values": [], "perceived": [], "users": []})
+            if isinstance(row.get(rate_key), (int, float)):
+                entry["values"].append(row[rate_key])
+            if isinstance(row.get(perceived_key), (int, float)):
+                entry["perceived"].append(row[perceived_key])
+            if isinstance(row.get("distinctUsers"), (int, float)):
+                entry["users"].append(row["distinctUsers"])
+        result = {}
+        for vc, data in by_version.items():
+            avg = lambda lst: round(sum(lst) / len(lst), 6) if lst else None  # noqa: E731
+            result[vc] = {
+                f"avg_{rate_key}": avg(data["values"]),
+                f"avg_{perceived_key}": avg(data["perceived"]),
+                "avgDistinctUsers": avg(data["users"]),
+            }
+        return result
+
+    crash_by_vc = _aggregate(crash_rows, "crashRate", "userPerceivedCrashRate")
+    anr_by_vc = _aggregate(anr_rows, "anrRate", "userPerceivedAnrRate")
+
+    all_vcs = sorted(
+        set(crash_by_vc) | set(anr_by_vc),
+        key=lambda x: int(x) if str(x).isdigit() else 0,
+        reverse=True,
+    )
+    summary = []
+    for vc in all_vcs:
+        entry: dict[str, Any] = {"versionCode": vc}
+        entry.update(crash_by_vc.get(vc, {}))
+        entry.update(anr_by_vc.get(vc, {}))
+        crash_pct = entry.get("avg_userPerceivedCrashRate")
+        anr_pct = entry.get("avg_userPerceivedAnrRate")
+        entry["exceedsCrashThreshold"] = crash_pct is not None and crash_pct > 0.0109
+        entry["exceedsAnrThreshold"] = anr_pct is not None and anr_pct > 0.0047
+        summary.append(entry)
+
+    return {
+        "packageName": package_name,
+        "periodDays": days,
+        "badBehaviorThresholds": {"userPerceivedCrashRate": 0.0109, "userPerceivedAnrRate": 0.0047},
+        "latestVersionSummary": summary[0] if summary else None,
+        "allVersions": summary,
+    }
+
+
+@mcp.tool()
+def list_error_issues(
+    package_name: str,
+    days: int = 30,
+    issue_type: str = "",
+    max_results: int = 50,
+) -> dict[str, Any]:
+    """List crash/ANR/non-fatal error issues with reports in the last N days.
+
+    The Reporting API has no "resolved/open" issue status — an issue is
+    included here whenever it has >=1 error report inside the requested
+    time window. Use days to bound what counts as "still occurring".
+
+    Args:
+        package_name: App package name
+        days: Past days to include (default 30, max 365)
+        issue_type: Optional filter: "CRASH", "ANR", or "NON_FATAL"
+        max_results: Max issues to return (default 50, max 1000)
+    """
+    days = max(1, min(days, 365))
+    client = get_reporting_client_from_context()
+    raw = client.search_error_issues(
+        package_name,
+        days=days,
+        issue_type=issue_type or None,
+        page_size=min(max_results, 1000),
+    )
+    return {
+        "packageName": package_name,
+        "periodDays": days,
+        "issues": raw.get("errorIssues", []),
+        "totalIssues": len(raw.get("errorIssues", [])),
+    }
+
+
+@mcp.tool()
+def get_error_reports(
+    package_name: str,
+    issue_id: str = "",
+    days: int = 30,
+    issue_type: str = "",
+    max_results: int = 20,
+    max_report_text_chars: int = 4000,
+) -> dict[str, Any]:
+    """Get raw error reports with stack trace (reportText) for crash/ANR issues.
+
+    Pass issue_id (the trailing id from an ErrorIssue's "name" field, as
+    returned by list_error_issues) to fetch the reports behind one specific
+    issue, including the device-produced stack trace / blocked-thread dump.
+
+    A single ANR reportText can be 50-100K+ chars (a dump of every thread in
+    the process, not just the blocked one) — reportText is truncated to
+    max_report_text_chars by default (the blocked/crashing thread is always
+    first). Pass 0 for the untruncated text.
+
+    Args:
+        package_name: App package name
+        issue_id: Optional error issue id to scope to one issue (from list_error_issues)
+        days: Past days to include (default 30, max 365)
+        issue_type: Optional filter: "CRASH", "ANR", or "NON_FATAL"
+        max_results: Max reports to return (default 20, max 100)
+        max_report_text_chars: Truncate each reportText to this many chars (default 4000, 0 = no truncation)
+    """
+    days = max(1, min(days, 365))
+    client = get_reporting_client_from_context()
+    raw = client.search_error_reports(
+        package_name,
+        days=days,
+        issue_id=issue_id or None,
+        issue_type=issue_type or None,
+        page_size=min(max_results, 100),
+    )
+    reports = raw.get("errorReports", [])
+    if max_report_text_chars > 0:
+        for report in reports:
+            text = report.get("reportText") or ""
+            if len(text) > max_report_text_chars:
+                report["reportText"] = text[:max_report_text_chars] + (
+                    f"\n... [truncated, {len(text) - max_report_text_chars} more chars; "
+                    "raise max_report_text_chars to see full text]"
+                )
+    return {
+        "packageName": package_name,
+        "periodDays": days,
+        "reports": reports,
+        "totalReports": len(reports),
+    }
 
 
 @mcp.tool()
@@ -3569,6 +3888,163 @@ def upload_internal_app_sharing_bundle(
         bundle_path=bundle_path,
     )
     return artifact.model_dump()
+
+
+# =============================================================================
+# BigQuery tools (raw Firebase export: Analytics events, Crashlytics, Sessions,
+# Performance Monitoring — whatever datasets are linked in the GCP project)
+# =============================================================================
+
+
+@mcp.tool()
+def bigquery_list_datasets(project_id: str) -> dict[str, Any]:
+    """List BigQuery datasets visible to the configured service account in a GCP project.
+
+    Args:
+        project_id: GCP project id (e.g. the Firebase project's project id)
+    """
+    client = get_bigquery_client_from_context()
+    raw = client.list_datasets(project_id)
+    return {
+        "projectId": project_id,
+        "datasets": [d["datasetReference"]["datasetId"] for d in raw.get("datasets", [])],
+    }
+
+
+@mcp.tool()
+def bigquery_list_tables(project_id: str, dataset_id: str, max_results: int = 50) -> dict[str, Any]:
+    """List tables in a BigQuery dataset (e.g. Firebase Analytics' daily events_YYYYMMDD tables).
+
+    Args:
+        project_id: GCP project id
+        dataset_id: Dataset id (e.g. "analytics_<property_id>", "firebase_crashlytics")
+        max_results: Max tables to return (default 50)
+    """
+    client = get_bigquery_client_from_context()
+    raw = client.list_tables(project_id, dataset_id, max_results)
+    return {
+        "projectId": project_id,
+        "datasetId": dataset_id,
+        "totalItems": raw.get("totalItems", 0),
+        "tables": [t["tableReference"]["tableId"] for t in raw.get("tables", [])],
+    }
+
+
+@mcp.tool()
+def bigquery_get_table_schema(project_id: str, dataset_id: str, table_id: str) -> dict[str, Any]:
+    """Get a BigQuery table's schema (field names/types) plus row/byte counts.
+
+    Args:
+        project_id: GCP project id
+        dataset_id: Dataset id
+        table_id: Table id
+    """
+    client = get_bigquery_client_from_context()
+    return client.get_table_schema(project_id, dataset_id, table_id)
+
+
+@mcp.tool()
+def bigquery_execute_query(
+    project_id: str,
+    query: str,
+    max_results: int = 100,
+    max_bytes_billed: int = 1_000_000_000,
+) -> dict[str, Any]:
+    """Run a read-only standard-SQL query against BigQuery.
+
+    The service account only has the bigquery.readonly scope (no
+    INSERT/UPDATE/DELETE/DDL). max_bytes_billed is an extra cost guardrail —
+    a query that would scan more bytes than this fails instead of running
+    (default 1 GB).
+
+    Args:
+        project_id: GCP project id
+        query: Standard SQL query, e.g.
+            "SELECT event_name, COUNT(*) n FROM `proj.analytics_123.events_*`
+             WHERE _TABLE_SUFFIX BETWEEN '20260701' AND '20260707'
+             GROUP BY event_name ORDER BY n DESC"
+        max_results: Max rows to return (default 100)
+        max_bytes_billed: Cost guardrail in bytes (default 1 GB)
+    """
+    client = get_bigquery_client_from_context()
+    raw = client.execute_query(project_id, query, max_results, max_bytes_billed)
+    fields = [f["name"] for f in raw.get("schema", {}).get("fields", [])]
+    rows = [
+        {fields[i]: cell.get("v") for i, cell in enumerate(row.get("f", []))}
+        for row in raw.get("rows", [])
+    ]
+    return {
+        "totalRows": raw.get("totalRows"),
+        "totalBytesProcessed": raw.get("totalBytesProcessed"),
+        "totalBytesBilled": raw.get("totalBytesBilled"),
+        "jobComplete": raw.get("jobComplete"),
+        "rows": rows,
+    }
+
+
+# =============================================================================
+# Google Analytics Data API tools (GA4 aggregated reports — server-side
+# rollups, distinct from BigQuery's raw per-event rows)
+# =============================================================================
+
+
+@mcp.tool()
+def analytics_run_report(
+    property_id: str,
+    dimensions: list[str],
+    metrics: list[str],
+    start_date: str = "7daysAgo",
+    end_date: str = "today",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Run a GA4 aggregated report (e.g. event counts by eventName over a date range).
+
+    Args:
+        property_id: GA4 property id (numeric, e.g. "521849462" — not the
+            Firebase project id)
+        dimensions: GA4 dimension names, e.g. ["eventName"]
+        metrics: GA4 metric names, e.g. ["eventCount"]
+        start_date: Start of date range, relative ("7daysAgo") or "YYYY-MM-DD"
+        end_date: End of date range, relative ("today") or "YYYY-MM-DD"
+        limit: Max rows to return (default 100)
+    """
+    client = get_analytics_client_from_context()
+    raw = client.run_report(property_id, dimensions, metrics, start_date, end_date, limit)
+    dim_names = [h["name"] for h in raw.get("dimensionHeaders", [])]
+    met_names = [h["name"] for h in raw.get("metricHeaders", [])]
+    rows = []
+    for row in raw.get("rows", []):
+        entry = {dim_names[i]: v["value"] for i, v in enumerate(row.get("dimensionValues", []))}
+        entry.update({met_names[i]: v["value"] for i, v in enumerate(row.get("metricValues", []))})
+        rows.append(entry)
+    return {"propertyId": property_id, "rowCount": raw.get("rowCount"), "rows": rows}
+
+
+@mcp.tool()
+def analytics_run_realtime_report(
+    property_id: str,
+    dimensions: list[str],
+    metrics: list[str],
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Run a GA4 realtime report (active users/events in roughly the last 30 minutes).
+
+    Args:
+        property_id: GA4 property id (numeric, e.g. "521849462")
+        dimensions: GA4 dimension names, e.g. ["eventName"]
+        metrics: GA4 metric names, e.g. ["activeUsers"]
+        limit: Max rows to return (default 100)
+    """
+    client = get_analytics_client_from_context()
+    raw = client.run_realtime_report(property_id, dimensions, metrics, limit)
+    dim_names = [h["name"] for h in raw.get("dimensionHeaders", [])]
+    met_names = [h["name"] for h in raw.get("metricHeaders", [])]
+    rows = []
+    for row in raw.get("rows", []):
+        entry = {dim_names[i]: v["value"] for i, v in enumerate(row.get("dimensionValues", []))}
+        entry.update({met_names[i]: v["value"] for i, v in enumerate(row.get("metricValues", []))})
+        rows.append(entry)
+    return {"propertyId": property_id, "rowCount": raw.get("rowCount"), "rows": rows}
 
 
 # =============================================================================
