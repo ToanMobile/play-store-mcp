@@ -1,0 +1,62 @@
+# Build stage
+FROM python:3.14-alpine@sha256:c6ead215bfd31f1e433d968853b7a769989117115b728874824e6c0a27cb96fc AS builder
+
+WORKDIR /build
+
+# Install uv for fast dependency resolution
+COPY --from=ghcr.io/astral-sh/uv:0.11.26@sha256:3d868e555f8f1dbc324afa005066cd11e1053fc4743b9808ca8025283e65efa5 /uv /usr/local/bin/uv
+
+COPY pyproject.toml uv.lock README.md ./
+COPY src/ src/
+
+# Sync straight from the lockfile into the final runtime venv path (so
+# shebangs point to /app/.venv/bin/python), instead of building a wheel and
+# letting `uv pip install` re-resolve deps fresh — that re-resolution doesn't
+# see uv.lock's already-decided prerelease pins and can fail to reproduce it.
+RUN UV_PROJECT_ENVIRONMENT=/app/.venv uv sync --frozen --no-editable
+
+# Runtime stage
+FROM python:3.14-alpine@sha256:c6ead215bfd31f1e433d968853b7a769989117115b728874824e6c0a27cb96fc
+
+LABEL org.opencontainers.image.source="https://github.com/lusky3/play-store-mcp"
+LABEL org.opencontainers.image.url="https://github.com/lusky3/play-store-mcp"
+LABEL org.opencontainers.image.documentation="https://lusky3.github.io/play-store-mcp"
+LABEL org.opencontainers.image.description="MCP server for Google Play Developer API — deploy apps, manage releases, reviews, and more"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.title="play-store-mcp"
+
+# Pick up any Alpine security patches released since this base image digest
+# was built (e.g. libuuid), without waiting on a new upstream base-image
+# build to bump the pin.
+RUN apk upgrade --no-cache
+
+# Security hardening: non-root user, no shell
+RUN addgroup -S mcp && \
+    adduser -S -G mcp -h /app -s /sbin/nologin mcp
+
+WORKDIR /app
+
+# Copy virtual environment from builder (already at /app/.venv)
+COPY --from=builder /app/.venv /app/.venv
+
+# MCP_HOST=0.0.0.0 is needed to be reachable from outside the container, so a
+# network transport (MCP_TRANSPORT=streamable-http / sse) refuses to start
+# unless PLAY_STORE_MCP_AUTH_TOKEN is provided, e.g.
+#   docker run -e MCP_TRANSPORT=streamable-http \
+#     -e PLAY_STORE_MCP_AUTH_TOKEN="$(openssl rand -hex 32)" -p 8000:8000 ...
+# (or PLAY_STORE_MCP_ALLOW_UNAUTHENTICATED=1 behind an authenticating proxy).
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MCP_TRANSPORT=stdio \
+    MCP_HOST=0.0.0.0 \
+    MCP_PORT=8000
+
+EXPOSE 8000
+
+USER mcp
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
+  CMD if [ "$MCP_TRANSPORT" = "streamable-http" ]; then wget -qO- http://localhost:${MCP_PORT:-8000}/health || exit 1; else exit 0; fi
+
+ENTRYPOINT ["play-store-mcp"]
